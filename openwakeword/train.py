@@ -21,10 +21,23 @@ from openwakeword.utils import compute_features_from_generator
 from openwakeword.utils import AudioFeatures
 
 
-# Base model class for an openwakeword model
-class Model(nn.Module):
-    def __init__(self, n_classes=1, input_shape=(16, 96), model_type="dnn",
-                 layer_dim=128, n_blocks=1, seconds_per_example=None):
+class MultiClassWakeWordModel(nn.Module):
+    def __init__(self, n_classes=3, input_shape=(16, 96), model_type="dnn",
+                 layer_dim=128, n_blocks=1, seconds_per_example=None, 
+                 class_names=None, negative_class_label=0):
+        """
+        Multi-class wake word detection model
+        
+        Args:
+            n_classes (int): Number of classes including negative class
+            input_shape (tuple): Input feature shape (time_steps, features)
+            model_type (str): "dnn" or "rnn"
+            layer_dim (int): Hidden layer dimension
+            n_blocks (int): Number of blocks for DNN
+            seconds_per_example (float): Duration of each example
+            class_names (list): Names of classes (e.g., ['background', 'alexa', 'hey_google'])
+            negative_class_label (int): Index of the negative/background class
+        """
         super().__init__()
 
         # Store inputs as attributes
@@ -32,156 +45,160 @@ class Model(nn.Module):
         self.input_shape = input_shape
         self.seconds_per_example = seconds_per_example
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        self.negative_class_label = negative_class_label
+        
+        # Set up class names
+        if class_names is None:
+            self.class_names = [f'class_{i}' for i in range(n_classes)]
+        else:
+            assert len(class_names) == n_classes, f"Number of class names ({len(class_names)}) must match n_classes ({n_classes})"
+            self.class_names = class_names
+        
+        # Model tracking
         self.best_models = []
         self.best_model_scores = []
-        self.best_val_fp = 1000
+        self.best_val_fp_per_hour = 1000
         self.best_val_accuracy = 0
         self.best_val_recall = 0
         self.best_train_recall = 0
 
-        # Define model (currently on fully-connected network supported)
+        # Define model architecture
         if model_type == "dnn":
-            # self.model = nn.Sequential(
-            #     nn.Flatten(),
-            #     nn.Linear(input_shape[0]*input_shape[1], layer_dim),
-            #     nn.LayerNorm(layer_dim),
-            #     nn.ReLU(),
-            #     nn.Linear(layer_dim, layer_dim),
-            #     nn.LayerNorm(layer_dim),
-            #     nn.ReLU(),
-            #     nn.Linear(layer_dim, n_classes),
-            #     nn.Sigmoid() if n_classes == 1 else nn.ReLU(),
-            # )
-
             class FCNBlock(nn.Module):
-                def __init__(self, layer_dim):
+                def __init__(self, layer_dim, dropout=0.1):
                     super().__init__()
                     self.fcn_layer = nn.Linear(layer_dim, layer_dim)
                     self.relu = nn.ReLU()
                     self.layer_norm = nn.LayerNorm(layer_dim)
+                    self.dropout = nn.Dropout(dropout)
 
                 def forward(self, x):
-                    return self.relu(self.layer_norm(self.fcn_layer(x)))
+                    return self.dropout(self.relu(self.layer_norm(self.fcn_layer(x))))
 
             class Net(nn.Module):
-                def __init__(self, input_shape, layer_dim, n_blocks=1, n_classes=1):
+                def __init__(self, input_shape, layer_dim, n_blocks=1, n_classes=3, dropout=0.1):
                     super().__init__()
                     self.flatten = nn.Flatten()
                     self.layer1 = nn.Linear(input_shape[0]*input_shape[1], layer_dim)
                     self.relu1 = nn.ReLU()
                     self.layernorm1 = nn.LayerNorm(layer_dim)
-                    self.blocks = nn.ModuleList([FCNBlock(layer_dim) for i in range(n_blocks)])
+                    self.dropout1 = nn.Dropout(dropout)
+                    self.blocks = nn.ModuleList([FCNBlock(layer_dim, dropout) for _ in range(n_blocks)])
                     self.last_layer = nn.Linear(layer_dim, n_classes)
-                    self.last_act = nn.Sigmoid() if n_classes == 1 else nn.ReLU()
 
                 def forward(self, x):
-                    x = self.relu1(self.layernorm1(self.layer1(self.flatten(x))))
+                    x = self.dropout1(self.relu1(self.layernorm1(self.layer1(self.flatten(x)))))
                     for block in self.blocks:
                         x = block(x)
-                    x = self.last_act(self.last_layer(x))
+                    x = self.last_layer(x)
                     return x
+                    
             self.model = Net(input_shape, layer_dim, n_blocks=n_blocks, n_classes=n_classes)
+            
         elif model_type == "rnn":
             class Net(nn.Module):
-                def __init__(self, input_shape, n_classes=1):
+                def __init__(self, input_shape, n_classes=3, hidden_dim=64, num_layers=2, dropout=0.1):
                     super().__init__()
-                    self.layer1 = nn.LSTM(input_shape[-1], 64, num_layers=2, bidirectional=True,
-                                          batch_first=True, dropout=0.0)
-                    self.layer2 = nn.Linear(64*2, n_classes)
-                    self.layer3 = nn.Sigmoid() if n_classes == 1 else nn.ReLU()
+                    self.lstm = nn.LSTM(input_shape[-1], hidden_dim, num_layers=num_layers, 
+                                       bidirectional=True, batch_first=True, dropout=dropout)
+                    self.dropout = nn.Dropout(dropout)
+                    self.classifier = nn.Linear(hidden_dim * 2, n_classes)
 
                 def forward(self, x):
-                    out, h = self.layer1(x)
-                    return self.layer3(self.layer2(out[:, -1]))
+                    lstm_out, _ = self.lstm(x)
+                    # Use the last output for classification
+                    last_output = lstm_out[:, -1, :]
+                    return self.classifier(self.dropout(last_output))
+                    
             self.model = Net(input_shape, n_classes)
 
-        # Define metrics
-        if n_classes == 1:
-            self.fp = lambda pred, y: (y-pred <= -0.5).sum()
-            self.recall = torchmetrics.Recall(task='binary')
-            self.accuracy = torchmetrics.Accuracy(task='binary')
-        else:
-            def multiclass_fp(p, y, threshold=0.5):
-                probs = torch.nn.functional.softmax(p, dim=1)
-                neg_ndcs = y == 0
-                fp = (probs[neg_ndcs].argmax(axis=1) != 0 & (probs[neg_ndcs].max(axis=1)[0] > threshold)).sum()
-                return fp
-
-            def positive_class_recall(p, y, negative_class_label=0, threshold=0.5):
-                probs = torch.nn.functional.softmax(p, dim=1)
-                pos_ndcs = y != 0
-                rcll = (probs[pos_ndcs].argmax(axis=1) > 0
-                        & (probs[pos_ndcs].max(axis=1)[0] >= threshold)).sum()/pos_ndcs.sum()
-                return rcll
-
-            def positive_class_accuracy(p, y, negative_class_label=0):
-                probs = torch.nn.functional.softmax(p, dim=1)
-                pos_preds = probs.argmax(axis=1) != negative_class_label
-                acc = (probs[pos_preds].argmax(axis=1) == y[pos_preds]).sum()/pos_preds.sum()
-                return acc
-
-            self.fp = multiclass_fp
-            self.acc = positive_class_accuracy
-            self.recall = positive_class_recall
-
-        self.n_fp = 0
-        self.val_fp = 0
+        # Define metrics for multi-class classification
+        self.accuracy = torchmetrics.Accuracy(task='multiclass', num_classes=n_classes)
+        self.precision = torchmetrics.Precision(task='multiclass', num_classes=n_classes, average='macro')
+        self.recall = torchmetrics.Recall(task='multiclass', num_classes=n_classes, average='macro')
+        self.f1_score = torchmetrics.F1Score(task='multiclass', num_classes=n_classes, average='macro')
+        
+        # Per-class metrics
+        self.per_class_precision = torchmetrics.Precision(task='multiclass', num_classes=n_classes, average=None)
+        self.per_class_recall = torchmetrics.Recall(task='multiclass', num_classes=n_classes, average=None)
+        self.per_class_f1 = torchmetrics.F1Score(task='multiclass', num_classes=n_classes, average=None)
 
         # Define logging dict (in-memory)
         self.history = collections.defaultdict(list)
 
         # Define optimizer and loss
-        self.loss = torch.nn.functional.binary_cross_entropy if n_classes == 1 else nn.functional.cross_entropy
+        self.loss_fn = nn.CrossEntropyLoss()
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.0001)
 
-    def save_model(self, output_path):
+    def compute_false_positives(self, predictions, targets, threshold=0.5):
         """
-        Saves the weights of a trained Pytorch model
+        Compute false positives for multi-class case
+        False positive: predicting any positive class when target is negative class
         """
-        if self.n_classes == 1:
-            torch.save(self.model, output_path)
+        probs = torch.nn.functional.softmax(predictions, dim=1)
+        negative_mask = targets == self.negative_class_label
+        
+        # Get predictions for negative samples
+        neg_probs = probs[negative_mask]
+        neg_preds = neg_probs.argmax(dim=1)
+        
+        # Count false positives (predicting positive class for negative samples)
+        fp = (neg_preds != self.negative_class_label).sum()
+        return fp
 
-    def export_to_onnx(self, output_path, class_mapping=""):
-        obj = self
-        # Make simple model for export based on model structure
-        if self.n_classes == 1:
-            # Save ONNX model
-            torch.onnx.export(self.model.to("cpu"), torch.rand(self.input_shape)[None, ], output_path,
-                              output_names=[class_mapping])
+    def compute_positive_class_recall(self, predictions, targets, threshold=0.5):
+        """
+        Compute recall for positive classes (excluding negative class)
+        """
+        probs = torch.nn.functional.softmax(predictions, dim=1)
+        positive_mask = targets != self.negative_class_label
+        
+        if positive_mask.sum() == 0:
+            return torch.tensor(0.0)
+        
+        pos_targets = targets[positive_mask]
+        pos_probs = probs[positive_mask]
+        pos_preds = pos_probs.argmax(dim=1)
+        
+        # Recall: correct positive predictions / total positives
+        correct_positives = (pos_preds == pos_targets).sum()
+        total_positives = positive_mask.sum()
+        
+        return correct_positives.float() / total_positives.float()
 
-        elif self.n_classes >= 1:
-            class M(nn.Module):
-                def __init__(self):
-                    super().__init__()
+    def compute_positive_class_precision(self, predictions, targets, threshold=0.5):
+        """
+        Compute precision for positive classes
+        """
+        probs = torch.nn.functional.softmax(predictions, dim=1)
+        preds = probs.argmax(dim=1)
+        
+        # Predictions that are not negative class
+        positive_preds_mask = preds != self.negative_class_label
+        
+        if positive_preds_mask.sum() == 0:
+            return torch.tensor(0.0)
+        
+        # Of the positive predictions, how many are correct?
+        pos_preds = preds[positive_preds_mask]
+        pos_targets = targets[positive_preds_mask]
+        
+        correct_pos_preds = (pos_preds == pos_targets).sum()
+        total_pos_preds = positive_preds_mask.sum()
+        
+        return correct_pos_preds.float() / total_pos_preds.float()
 
-                    # Define model
-                    self.model = obj.model.to("cpu")
-
-                def forward(self, x):
-                    return torch.nn.functional.softmax(self.model(x), dim=1)
-
-            # Save ONNX model
-            torch.onnx.export(M(), torch.rand(self.input_shape)[None, ], output_path,
-                              output_names=[class_mapping])
-
-    def lr_warmup_cosine_decay(self,
-                               global_step,
-                               warmup_steps=0,
-                               hold=0,
-                               total_steps=0,
-                               start_lr=0.0,
-                               target_lr=1e-3
-                               ):
+    def lr_warmup_cosine_decay(self, global_step, warmup_steps=0, hold=0, total_steps=0,
+                               start_lr=0.0, target_lr=1e-3):
+        """Learning rate scheduling with warmup and cosine decay"""
         # Cosine decay
         learning_rate = 0.5 * target_lr * (1 + np.cos(np.pi * (global_step - warmup_steps - hold)
                                            / float(total_steps - warmup_steps - hold)))
 
-        # Target LR * progress of warmup (=1 at the final warmup step)
+        # Target LR * progress of warmup
         warmup_lr = target_lr * (global_step / warmup_steps)
 
-        # Choose between `warmup_lr`, `target_lr` and `learning_rate` based on whether
-        # `global_step < warmup_steps` and we're still holding.
-        # i.e. warm up if we're still warming up and use cosine decayed lr otherwise
+        # Choose learning rate based on current step
         if hold > 0:
             learning_rate = np.where(global_step > warmup_steps + hold,
                                      learning_rate, target_lr)
@@ -195,380 +212,341 @@ class Model(nn.Module):
     def summary(self):
         return torchinfo.summary(self.model, input_size=(1,) + self.input_shape, device='cpu')
 
-    def average_models(self, models=None):
-        """Averages the weights of the provided models together to make a new model"""
+    def save_model(self, output_path):
+        """Save the trained PyTorch model"""
+        torch.save(self.model.state_dict(), output_path)
+        
+    def load_model(self, model_path):
+        """Load a trained PyTorch model"""
+        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
 
-        if models is None:
-            models = self.best_models
+    def export_to_onnx(self, output_path, input_names=None, output_names=None):
+        """Export model to ONNX format"""
+        if input_names is None:
+            input_names = ['input']
+        if output_names is None:
+            output_names = self.class_names
+            
+        # Create a wrapper model that includes softmax for probability output
+        class ONNXModel(nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+                
+            def forward(self, x):
+                logits = self.model(x)
+                return torch.nn.functional.softmax(logits, dim=1)
+        
+        onnx_model = ONNXModel(self.model.to("cpu"))
+        torch.onnx.export(
+            onnx_model,
+            torch.rand(1, *self.input_shape),
+            output_path,
+            input_names=input_names,
+            output_names=output_names,
+            opset_version=13
+        )
 
-        # Clone a model from the list as the base for the averaged model
-        averaged_model = copy.deepcopy(models[0])
-        averaged_model_dict = averaged_model.state_dict()
-
-        # Initialize a running total of the weights
-        for key in averaged_model_dict:
-            averaged_model_dict[key] *= 0  # set to 0
-
-        for model in models:
-            model_dict = model.state_dict()
-            for key, value in model_dict.items():
-                averaged_model_dict[key] += value
-
-        for key in averaged_model_dict:
-            averaged_model_dict[key] /= len(models)
-
-        # Load the averaged weights into the model
-        averaged_model.load_state_dict(averaged_model_dict)
-
-        return averaged_model
-
-    def _select_best_model(self, false_positive_validate_data, val_set_hrs=11.3, max_fp_per_hour=0.5, min_recall=0.20):
+    def predict_on_features(self, features, return_probabilities=True):
         """
-        Select the top model based on the false positive rate on the validation data
-
+        Predict on feature tensors
+        
         Args:
-            false_positive_validate_data (torch.DataLoader): A dataloader with validation data
-            n (int): The number of models to select
-
+            features: Input features tensor
+            return_probabilities: If True, return softmax probabilities; if False, return logits
+        
         Returns:
-            list: A list of the top n models
+            Predictions (probabilities or logits) and predicted class indices
         """
-        # Get false positive rates for each model
-        false_positive_rates = [0]*len(self.best_models)
-        for batch in false_positive_validate_data:
-            x_val, y_val = batch[0].to(self.device), batch[1].to(self.device)
-            for mdl_ndx, model in tqdm(enumerate(self.best_models), total=len(self.best_models),
-                                       desc="Find best checkpoints by false positive rate"):
-                with torch.no_grad():
-                    val_ps = model(x_val)
-                    false_positive_rates[mdl_ndx] = false_positive_rates[mdl_ndx] + self.fp(val_ps, y_val[..., None]).detach().cpu().numpy()
-        false_positive_rates = [fp/val_set_hrs for fp in false_positive_rates]
-
-        candidate_model_ndx = [ndx for ndx, fp in enumerate(false_positive_rates) if fp <= max_fp_per_hour]
-        candidate_model_recall = [self.best_model_scores[ndx]["val_recall"] for ndx in candidate_model_ndx]
-        if max(candidate_model_recall) <= min_recall:
-            logging.warning(f"No models with recall >= {min_recall} found!")
-            return None
-        else:
-            best_model = self.best_models[candidate_model_ndx[np.argmax(candidate_model_recall)]]
-            best_model_training_step = self.best_model_scores[candidate_model_ndx[np.argmax(candidate_model_recall)]]["training_step_ndx"]
-            logging.info(f"Best model from training step {best_model_training_step} out of {len(candidate_model_ndx)}"
-                         f"models has recall of {np.max(candidate_model_recall)} and false positive rate of"
-                         f" {false_positive_rates[candidate_model_ndx[np.argmax(candidate_model_recall)]]}")
-
-        return best_model
-
-    def auto_train(self, X_train, X_val, false_positive_val_data, steps=50000, max_negative_weight=1000,
-                   target_fp_per_hour=0.2):
-        """A sequence of training steps that produce relatively strong models
-        automatically, based on validation data and performance targets provided.
-        After training merges the best checkpoints and returns a single model.
-        """
-
-        # Get false positive validation data duration
-        val_set_hrs = 11.3
-
-        # Sequence 1
-        logging.info("#"*50 + "\nStarting training sequence 1...\n" + "#"*50)
-        lr = 0.0001
-        weights = np.linspace(1, max_negative_weight, int(steps)).tolist()
-        val_steps = np.linspace(steps-int(steps*0.25), steps, 20).astype(np.int64)
-        self.train_model(
-                    X=X_train,
-                    X_val=X_val,
-                    false_positive_val_data=false_positive_val_data,
-                    max_steps=steps,
-                    negative_weight_schedule=weights,
-                    val_steps=val_steps, warmup_steps=steps//5,
-                    hold_steps=steps//3, lr=lr, val_set_hrs=val_set_hrs)
-
-        # Sequence 2
-        logging.info("#"*50 + "\nStarting training sequence 2...\n" + "#"*50)
-        lr = lr/10
-        steps = steps/10
-
-        # Adjust weights as needed based on false positive per hour performance from first sequence
-        if self.best_val_fp > target_fp_per_hour:
-            max_negative_weight = max_negative_weight*2
-            logging.info("Increasing weight on negative examples to reduce false positives...")
-
-        weights = np.linspace(1, max_negative_weight, int(steps)).tolist()
-        val_steps = np.linspace(1, steps, 20).astype(np.int16)
-        self.train_model(
-                    X=X_train,
-                    X_val=X_val,
-                    false_positive_val_data=false_positive_val_data,
-                    max_steps=steps,
-                    negative_weight_schedule=weights,
-                    val_steps=val_steps, warmup_steps=steps//5,
-                    hold_steps=steps//3, lr=lr, val_set_hrs=val_set_hrs)
-
-        # Sequence 3
-        logging.info("#"*50 + "\nStarting training sequence 3...\n" + "#"*50)
-        lr = lr/10
-
-        # Adjust weights as needed based on false positive per hour performance from second sequence
-        if self.best_val_fp > target_fp_per_hour:
-            max_negative_weight = max_negative_weight*2
-            logging.info("Increasing weight on negative examples to reduce false positives...")
-
-        weights = np.linspace(1, max_negative_weight, int(steps)).tolist()
-        val_steps = np.linspace(1, steps, 20).astype(np.int16)
-        self.train_model(
-                    X=X_train,
-                    X_val=X_val,
-                    false_positive_val_data=false_positive_val_data,
-                    max_steps=steps,
-                    negative_weight_schedule=weights,
-                    val_steps=val_steps, warmup_steps=steps//5,
-                    hold_steps=steps//3, lr=lr, val_set_hrs=val_set_hrs)
-
-        # Merge best models
-        logging.info("Merging checkpoints above the 90th percentile into single model...")
-        accuracy_percentile = np.percentile(self.history["val_accuracy"], 90)
-        recall_percentile = np.percentile(self.history["val_recall"], 90)
-        fp_percentile = np.percentile(self.history["val_fp_per_hr"], 10)
-
-        # Get models above the 90th percentile
-        models = []
-        for model, score in zip(self.best_models, self.best_model_scores):
-            if score["val_accuracy"] >= accuracy_percentile and \
-                    score["val_recall"] >= recall_percentile and \
-                    score["val_fp_per_hr"] <= fp_percentile:
-                models.append(model)
-
-        if len(models) > 0:
-            combined_model = self.average_models(models=models)
-        else:
-            combined_model = self.model
-
-        # Report validation metrics for combined model
+        self.model.eval()
         with torch.no_grad():
-            for batch in X_val:
-                x, y = batch[0].to(self.device), batch[1].to(self.device)
-                val_ps = combined_model(x)
+            if len(features.shape) == 2:
+                features = features.unsqueeze(0)
+            
+            features = features.to(self.device)
+            predictions = []
+            
+            for x in tqdm(features, desc="Predicting on clips"):
+                x = x.unsqueeze(0)
+                batch = []
+                # Sliding window prediction
+                for i in range(0, x.shape[1] - 16, 1):
+                    batch.append(x[:, i:i+16, :])
+                
+                if batch:
+                    batch = torch.stack(batch, dim=0).squeeze(1)
+                    logits = self.model(batch)
+                    
+                    if return_probabilities:
+                        probs = torch.nn.functional.softmax(logits, dim=1)
+                        # Take the maximum probability across all windows
+                        max_prob, _ = torch.max(probs, dim=0)
+                        predictions.append(max_prob.cpu().numpy())
+                    else:
+                        # Take the maximum logit across all windows
+                        max_logit, _ = torch.max(logits, dim=0)
+                        predictions.append(max_logit.cpu().numpy())
+            
+            predictions = np.array(predictions)
+            predicted_classes = np.argmax(predictions, axis=1)
+            
+            return predictions, predicted_classes
 
-            combined_model_recall = self.recall(val_ps, y[..., None]).detach().cpu().numpy()
-            combined_model_accuracy = self.accuracy(val_ps, y[..., None].to(torch.int64)).detach().cpu().numpy()
-
-            combined_model_fp = 0
-            for batch in false_positive_val_data:
-                x_val, y_val = batch[0].to(self.device), batch[1].to(self.device)
-                val_ps = combined_model(x_val)
-                combined_model_fp += self.fp(val_ps, y_val[..., None])
-
-            combined_model_fp_per_hr = (combined_model_fp/val_set_hrs).detach().cpu().numpy()
-
-        logging.info(f"\n################\nFinal Model Accuracy: {combined_model_accuracy}"
-                     f"\nFinal Model Recall: {combined_model_recall}\nFinal Model False Positives per Hour: {combined_model_fp_per_hr}"
-                     "\n################\n")
-
-        return combined_model
-
-    def predict_on_features(self, features, model=None):
+    def predict_on_clips(self, clips, return_probabilities=True):
         """
-        Predict on Tensors of openWakeWord features corresponding to single audio clips
-
+        Predict on raw audio clips
+        
         Args:
-            features (torch.Tensor): A Tensor of openWakeWord features with shape (batch, features)
-            model (torch.nn.Module): A Pytorch model to use for prediction (default None, which will use self.model)
-
+            clips: Raw audio data
+            return_probabilities: If True, return softmax probabilities
+            
         Returns:
-            torch.Tensor: An array of predictions of shape (batch, prediction), where 0 is negative and 1 is positive
+            Predictions and predicted class indices
         """
-        if len(features) < 3:
-            features = features[None, ]
-
-        features = features.to(self.device)
-        predictions = []
-        for x in tqdm(features, desc="Predicting on clips"):
-            x = x[None, ]
-            batch = []
-            for i in range(0, x.shape[1]-16, 1):  # step size of 1 (80 ms)
-                batch.append(x[:, i:i+16, :])
-            batch = torch.vstack(batch)
-            if model is None:
-                preds = self.model(batch)
-            else:
-                preds = model(batch)
-            predictions.append(preds.detach().cpu().numpy()[None, ])
-
-        return np.vstack(predictions)
-
-    def predict_on_clips(self, clips, model=None):
-        """
-        Predict on Tensors of 16-bit 16 khz audio data
-
-        Args:
-            clips (np.ndarray): A Numpy array of audio clips with shape (batch, samples)
-            model (torch.nn.Module): A Pytorch model to use for prediction (default None, which will use self.model)
-
-        Returns:
-            np.ndarray: An array of predictions of shape (batch, prediction), where 0 is negative and 1 is positive
-        """
-
         # Get features from clips
         F = AudioFeatures(device='cpu', ncpu=4)
         features = F.embed_clips(clips, batch_size=16)
-
+        
         # Predict on features
-        preds = self.predict_on_features(torch.from_numpy(features), model=model)
+        predictions, predicted_classes = self.predict_on_features(
+            torch.from_numpy(features), 
+            return_probabilities=return_probabilities
+        )
+        
+        return predictions, predicted_classes
 
-        return preds
-
-    def export_model(self, model, model_name, output_dir):
-        """Saves the trained openwakeword model to both onnx and tflite formats"""
-
-        if self.n_classes != 1:
-            raise ValueError("Exporting models to both onnx and tflite with more than one class is currently not supported! "
-                             "Use the `export_to_onnx` function instead.")
-
-        # Save ONNX model
-        logging.info(f"####\nSaving ONNX mode as '{os.path.join(output_dir, model_name + '.onnx')}'")
-        model_to_save = copy.deepcopy(model)
-        torch.onnx.export(model_to_save.to("cpu"), torch.rand(self.input_shape)[None, ],
-                          os.path.join(output_dir, model_name + ".onnx"), opset_version=13)
-
-        return None
-
-    def train_model(self, X, max_steps, warmup_steps, hold_steps, X_val=None,
-                    false_positive_val_data=None, positive_test_clips=None,
-                    negative_weight_schedule=[1],
-                    val_steps=[250], lr=0.0001, val_set_hrs=1):
-        # Move models and main class to target device
-        self.to(self.device)
+    def train_model(self, train_loader, val_loader, false_positive_val_loader=None,
+                   max_steps=10000, warmup_steps=1000, hold_steps=2000,
+                   lr=0.001, val_steps=None, val_set_hrs=1.0,
+                   class_weights=None, save_checkpoints=True):
+        """
+        Train the multi-class wake word model
+        
+        Args:
+            train_loader: Training data loader
+            val_loader: Validation data loader
+            false_positive_val_loader: Loader for false positive validation
+            max_steps: Maximum training steps
+            warmup_steps: Steps for learning rate warmup
+            hold_steps: Steps to hold at target learning rate
+            lr: Target learning rate
+            val_steps: Steps at which to run validation
+            val_set_hrs: Hours of validation data for FP calculation
+            class_weights: Weights for each class in loss calculation
+            save_checkpoints: Whether to save best model checkpoints
+        """
+        
+        if val_steps is None:
+            val_steps = list(range(500, max_steps, 500))
+        
+        # Set up class weights for imbalanced datasets
+        if class_weights is not None:
+            class_weights = torch.tensor(class_weights, dtype=torch.float32).to(self.device)
+            self.loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+        
+        # Move model to device
         self.model.to(self.device)
-
-        # Train model
-        accumulation_steps = 1
-        accumulated_samples = 0
-        accumulated_predictions = torch.Tensor([]).to(self.device)
-        accumulated_labels = torch.Tensor([]).to(self.device)
-        for step_ndx, data in tqdm(enumerate(X, 0), total=max_steps, desc="Training"):
-            # get the inputs; data is a list of [inputs, labels]
-            x, y = data[0].to(self.device), data[1].to(self.device)
-            y_ = y[..., None].to(torch.float32)
-
-            # Update learning rates
-            for g in self.optimizer.param_groups:
-                g['lr'] = self.lr_warmup_cosine_decay(step_ndx, warmup_steps=warmup_steps, hold=hold_steps,
-                                                      total_steps=max_steps, target_lr=lr)
-
-            # zero the parameter gradients
+        self.model.train()
+        
+        # Training loop
+        step = 0
+        train_iter = iter(train_loader)
+        
+        for step in tqdm(range(max_steps), desc="Training"):
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                batch = next(train_iter)
+            
+            x, y = batch[0].to(self.device), batch[1].to(self.device)
+            
+            # Update learning rate
+            current_lr = self.lr_warmup_cosine_decay(
+                step, warmup_steps=warmup_steps, hold=hold_steps,
+                total_steps=max_steps, target_lr=lr
+            )
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = current_lr
+            
+            # Forward pass
             self.optimizer.zero_grad()
+            logits = self.model(x)
+            loss = self.loss_fn(logits, y)
+            
+            # Backward pass
+            loss.backward()
+            self.optimizer.step()
+            
+            # Log training metrics
+            self.history["loss"].append(loss.item())
+            self.history["lr"].append(current_lr)
+            
+            # Validation
+            if step in val_steps and step > 0:
+                self.model.eval()
+                val_loss = 0
+                all_val_preds = []
+                all_val_targets = []
+                
+                with torch.no_grad():
+                    for val_batch in val_loader:
+                        x_val, y_val = val_batch[0].to(self.device), val_batch[1].to(self.device)
+                        val_logits = self.model(x_val)
+                        val_loss += self.loss_fn(val_logits, y_val).item()
+                        
+                        all_val_preds.append(val_logits)
+                        all_val_targets.append(y_val)
+                
+                # Compute validation metrics
+                all_val_preds = torch.cat(all_val_preds, dim=0)
+                all_val_targets = torch.cat(all_val_targets, dim=0)
+                
+                val_accuracy = self.accuracy(all_val_preds, all_val_targets)
+                val_precision = self.precision(all_val_preds, all_val_targets)
+                val_recall = self.recall(all_val_preds, all_val_targets)
+                val_f1 = self.f1_score(all_val_preds, all_val_targets)
+                
+                # Compute wake word specific metrics
+                val_fp = self.compute_false_positives(all_val_preds, all_val_targets)
+                val_pos_recall = self.compute_positive_class_recall(all_val_preds, all_val_targets)
+                val_pos_precision = self.compute_positive_class_precision(all_val_preds, all_val_targets)
+                
+                # False positives per hour
+                val_fp_per_hour = val_fp.float() / val_set_hrs
+                
+                # Log validation metrics
+                self.history["val_loss"].append(val_loss / len(val_loader))
+                self.history["val_accuracy"].append(val_accuracy.item())
+                self.history["val_precision"].append(val_precision.item())
+                self.history["val_recall"].append(val_recall.item())
+                self.history["val_f1"].append(val_f1.item())
+                self.history["val_fp_per_hour"].append(val_fp_per_hour.item())
+                self.history["val_positive_recall"].append(val_pos_recall.item())
+                self.history["val_positive_precision"].append(val_pos_precision.item())
+                
+                # Per-class metrics
+                per_class_prec = self.per_class_precision(all_val_preds, all_val_targets)
+                per_class_rec = self.per_class_recall(all_val_preds, all_val_targets)
+                per_class_f1_scores = self.per_class_f1(all_val_preds, all_val_targets)
+                
+                # Log per-class metrics
+                for i, class_name in enumerate(self.class_names):
+                    self.history[f"val_{class_name}_precision"].append(per_class_prec[i].item())
+                    self.history[f"val_{class_name}_recall"].append(per_class_rec[i].item())
+                    self.history[f"val_{class_name}_f1"].append(per_class_f1_scores[i].item())
+                
+                # Save best models based on criteria
+                if save_checkpoints:
+                    current_score = {
+                        'step': step,
+                        'val_accuracy': val_accuracy.item(),
+                        'val_recall': val_recall.item(),
+                        'val_f1': val_f1.item(),
+                        'val_fp_per_hour': val_fp_per_hour.item(),
+                        'val_positive_recall': val_pos_recall.item(),
+                        'val_positive_precision': val_pos_precision.item()
+                    }
+                    
+                    # Save if this is a good model (high recall, low FP rate)
+                    if (val_pos_recall > 0.7 and val_fp_per_hour < 1.0) or len(self.best_models) < 5:
+                        self.best_models.append(copy.deepcopy(self.model.state_dict()))
+                        self.best_model_scores.append(current_score)
+                        
+                        # Keep only top 10 models
+                        if len(self.best_models) > 10:
+                            # Sort by F1 score and keep best
+                            sorted_indices = sorted(range(len(self.best_model_scores)), 
+                                                   key=lambda i: self.best_model_scores[i]['val_f1'], 
+                                                   reverse=True)
+                            self.best_models = [self.best_models[i] for i in sorted_indices[:10]]
+                            self.best_model_scores = [self.best_model_scores[i] for i in sorted_indices[:10]]
+                
+                # Print validation results
+                logging.info(f"Step {step}: Val Acc: {val_accuracy:.4f}, "
+                           f"Val Recall: {val_recall:.4f}, Val F1: {val_f1:.4f}, "
+                           f"FP/hr: {val_fp_per_hour:.2f}, Pos Recall: {val_pos_recall:.4f}")
+                
+                self.model.train()
+        
+        logging.info("Training completed!")
+        return self.history
 
-            # Get predictions for batch
-            predictions = self.model(x)
+    def get_best_model(self, criteria='val_f1'):
+        """
+        Get the best model based on specified criteria
+        
+        Args:
+            criteria: Metric to use for selection ('val_f1', 'val_positive_recall', etc.)
+        
+        Returns:
+            Best model state dict and its scores
+        """
+        if not self.best_models:
+            return None, None
+        
+        # Find best model based on criteria
+        best_idx = max(range(len(self.best_model_scores)), 
+                      key=lambda i: self.best_model_scores[i].get(criteria, 0))
+        
+        return self.best_models[best_idx], self.best_model_scores[best_idx]
 
-            # Construct batch with only samples that have high loss
-            neg_high_loss = predictions[(y == 0) & (predictions.squeeze() >= 0.001)]  # thresholds were chosen arbitrarily but work well
-            pos_high_loss = predictions[(y == 1) & (predictions.squeeze() < 0.999)]
-            y = torch.cat((y[(y == 0) & (predictions.squeeze() >= 0.001)], y[(y == 1) & (predictions.squeeze() < 0.999)]))
-            y_ = y[..., None].to(torch.float32)
-            predictions = torch.cat((neg_high_loss, pos_high_loss))
+    def load_best_model(self, criteria='val_f1'):
+        """Load the best model into the current model"""
+        best_state_dict, best_scores = self.get_best_model(criteria)
+        if best_state_dict is not None:
+            self.model.load_state_dict(best_state_dict)
+            logging.info(f"Loaded best model with {criteria}: {best_scores[criteria]:.4f}")
+        else:
+            logging.warning("No best models available to load")
 
-            # Set weights for batch
-            if len(negative_weight_schedule) == 1:
-                w = torch.ones(y.shape[0])*negative_weight_schedule[0]
-                pos_ndcs = y == 1
-                w[pos_ndcs] = 1
-                w = w[..., None]
-            else:
-                if self.n_classes == 1:
-                    w = torch.ones(y.shape[0])*negative_weight_schedule[step_ndx]
-                    pos_ndcs = y == 1
-                    w[pos_ndcs] = 1
-                    w = w[..., None]
-
-            if predictions.shape[0] != 0:
-                # Do backpropagation, with gradient accumulation if the batch-size after selecting high loss examples is too small
-                loss = self.loss(predictions, y_ if self.n_classes == 1 else y, w.to(self.device))
-                loss = loss/accumulation_steps
-                accumulated_samples += predictions.shape[0]
-
-                if predictions.shape[0] >= 128:
-                    accumulated_predictions = predictions
-                    accumulated_labels = y_
-                if accumulated_samples < 128:
-                    accumulation_steps += 1
-                    accumulated_predictions = torch.cat((accumulated_predictions, predictions))
-                    accumulated_labels = torch.cat((accumulated_labels, y_))
-                else:
-                    loss.backward()
-                    self.optimizer.step()
-                    accumulation_steps = 1
-                    accumulated_samples = 0
-
-                    self.history["loss"].append(loss.detach().cpu().numpy())
-
-                    # Compute training metrics and log them
-                    fp = self.fp(accumulated_predictions, accumulated_labels if self.n_classes == 1 else y)
-                    self.n_fp += fp
-                    self.history["recall"].append(self.recall(accumulated_predictions, accumulated_labels).detach().cpu().numpy())
-
-                    accumulated_predictions = torch.Tensor([]).to(self.device)
-                    accumulated_labels = torch.Tensor([]).to(self.device)
-
-            # Run validation and log validation metrics
-            if step_ndx in val_steps and step_ndx > 1 and false_positive_val_data is not None:
-                # Get false positives per hour with false positive data
-                val_fp = 0
-                for val_step_ndx, data in enumerate(false_positive_val_data):
-                    with torch.no_grad():
-                        x_val, y_val = data[0].to(self.device), data[1].to(self.device)
-                        val_predictions = self.model(x_val)
-                        val_fp += self.fp(val_predictions, y_val[..., None])
-                val_fp_per_hr = (val_fp/val_set_hrs).detach().cpu().numpy()
-                self.history["val_fp_per_hr"].append(val_fp_per_hr)
-
-            # Get recall on test clips
-            if step_ndx in val_steps and step_ndx > 1 and positive_test_clips is not None:
-                tp = 0
-                fn = 0
-                for val_step_ndx, data in enumerate(positive_test_clips):
-                    with torch.no_grad():
-                        x_val = data[0].to(self.device)
-                        batch = []
-                        for i in range(0, x_val.shape[1]-16, 1):
-                            batch.append(x_val[:, i:i+16, :])
-                        batch = torch.vstack(batch)
-                        preds = self.model(batch)
-                        if any(preds >= 0.5):
-                            tp += 1
-                        else:
-                            fn += 1
-                self.history["positive_test_clips_recall"].append(tp/(tp + fn))
-
-            if step_ndx in val_steps and step_ndx > 1 and X_val is not None:
-                # Get metrics for balanced test examples of positive and negative clips
-                for val_step_ndx, data in enumerate(X_val):
-                    with torch.no_grad():
-                        x_val, y_val = data[0].to(self.device), data[1].to(self.device)
-                        val_predictions = self.model(x_val)
-                        val_recall = self.recall(val_predictions, y_val[..., None]).detach().cpu().numpy()
-                        val_acc = self.accuracy(val_predictions, y_val[..., None].to(torch.int64))
-                        val_fp = self.fp(val_predictions, y_val[..., None])
-                self.history["val_accuracy"].append(val_acc.detach().cpu().numpy())
-                self.history["val_recall"].append(val_recall)
-                self.history["val_n_fp"].append(val_fp.detach().cpu().numpy())
-
-            # Save models with a validation score above/below the 90th percentile
-            # of the validation scores up to that point
-            if step_ndx in val_steps and step_ndx > 1:
-                if self.history["val_n_fp"][-1] <= np.percentile(self.history["val_n_fp"], 50) and \
-                   self.history["val_recall"][-1] >= np.percentile(self.history["val_recall"], 5):
-                    # logging.info("Saving checkpoint with metrics >= to targets!")
-                    self.best_models.append(copy.deepcopy(self.model))
-                    self.best_model_scores.append({"training_step_ndx": step_ndx, "val_n_fp": self.history["val_n_fp"][-1],
-                                                   "val_recall": self.history["val_recall"][-1],
-                                                   "val_accuracy": self.history["val_accuracy"][-1],
-                                                   "val_fp_per_hr": self.history.get("val_fp_per_hr", [0])[-1]})
-                    self.best_val_recall = self.history["val_recall"][-1]
-                    self.best_val_accuracy = self.history["val_accuracy"][-1]
-
-            if step_ndx == max_steps-1:
-                break
-
+    def evaluate_model(self, test_loader, return_per_class=True):
+        """
+        Evaluate the model on test data
+        
+        Args:
+            test_loader: Test data loader
+            return_per_class: Whether to return per-class metrics
+            
+        Returns:
+            Dictionary of evaluation metrics
+        """
+        self.model.eval()
+        all_preds = []
+        all_targets = []
+        
+        with torch.no_grad():
+            for batch in tqdm(test_loader, desc="Evaluating"):
+                x, y = batch[0].to(self.device), batch[1].to(self.device)
+                logits = self.model(x)
+                all_preds.append(logits)
+                all_targets.append(y)
+        
+        all_preds = torch.cat(all_preds, dim=0)
+        all_targets = torch.cat(all_targets, dim=0)
+        
+        # Compute metrics
+        metrics = {
+            'accuracy': self.accuracy(all_preds, all_targets).item(),
+            'precision': self.precision(all_preds, all_targets).item(),
+            'recall': self.recall(all_preds, all_targets).item(),
+            'f1_score': self.f1_score(all_preds, all_targets).item(),
+            'false_positives': self.compute_false_positives(all_preds, all_targets).item(),
+            'positive_recall': self.compute_positive_class_recall(all_preds, all_targets).item(),
+            'positive_precision': self.compute_positive_class_precision(all_preds, all_targets).item()
+        }
+        
+        if return_per_class:
+            per_class_prec = self.per_class_precision(all_preds, all_targets)
+            per_class_rec = self.per_class_recall(all_preds, all_targets)
+            per_class_f1_scores = self.per_class_f1(all_preds, all_targets)
+            
+            for i, class_name in enumerate(self.class_names):
+                metrics[f'{class_name}_precision'] = per_class_prec[i].item()
+                metrics[f'{class_name}_recall'] = per_class_rec[i].item()
+                metrics[f'{class_name}_f1'] = per_class_f1_scores[i].item()
+        
+        return metrics
 
 # Separate function to convert onnx models to tflite format
 def convert_onnx_to_tflite(onnx_model_path, output_path):
@@ -591,7 +569,6 @@ def convert_onnx_to_tflite(onnx_model_path, output_path):
             f.write(tflite_model)
 
     return None
-
 
 if __name__ == '__main__':
     # Get training config file
@@ -645,8 +622,21 @@ if __name__ == '__main__':
     if not os.path.exists(os.path.join(config["output_dir"], config["model_name"])):
         os.mkdir(os.path.join(config["output_dir"], config["model_name"]))
 
-    positive_train_output_dir = os.path.join(config["output_dir"], config["model_name"], "positive_train")
-    positive_test_output_dir = os.path.join(config["output_dir"], config["model_name"], "positive_test")
+    # Create directories for each class
+    class_names = config["class_names"]  # e.g., ['background', 'alexa', 'hey_google', 'jarvis']
+    n_classes = len(class_names)
+    negative_class_label = config.get("negative_class_label", 0)
+    
+    # Create output directories for each class
+    class_train_dirs = {}
+    class_test_dirs = {}
+    
+    for i, class_name in enumerate(class_names):
+        if i != negative_class_label:  # Skip negative class (will be generated separately)
+            class_train_dirs[class_name] = os.path.join(config["output_dir"], config["model_name"], f"{class_name}_train")
+            class_test_dirs[class_name] = os.path.join(config["output_dir"], config["model_name"], f"{class_name}_test")
+    
+    # Negative class directories
     negative_train_output_dir = os.path.join(config["output_dir"], config["model_name"], "negative_train")
     negative_test_output_dir = os.path.join(config["output_dir"], config["model_name"], "negative_test")
     feature_save_dir = os.path.join(config["output_dir"], config["model_name"])
@@ -660,36 +650,43 @@ if __name__ == '__main__':
         background_paths.extend([i.path for i in os.scandir(background_path)]*duplication_rate)
 
     if args.generate_clips is True:
-        # Generate positive clips for training
-        logging.info("#"*50 + "\nGenerating positive clips for training\n" + "#"*50)
-        if not os.path.exists(positive_train_output_dir):
-            os.mkdir(positive_train_output_dir)
-        n_current_samples = len(os.listdir(positive_train_output_dir))
-        if n_current_samples <= 0.95*config["n_samples"]:
-            generate_samples(
-                text=config["target_phrase"], max_samples=config["n_samples"]-n_current_samples,
-                batch_size=config["tts_batch_size"],
-                noise_scales=[0.98], noise_scale_ws=[0.98], length_scales=[0.75, 1.0, 1.25],
-                output_dir=positive_train_output_dir, auto_reduce_batch_size=True,
-                file_names=[uuid.uuid4().hex + ".wav" for i in range(config["n_samples"])]
-            )
-            torch.cuda.empty_cache()
-        else:
-            logging.warning(f"Skipping generation of positive clips for training, as ~{config['n_samples']} already exist")
+        # Generate positive clips for each class
+        for i, class_name in enumerate(class_names):
+            if i == negative_class_label:  # Skip negative class
+                continue
+                
+            target_phrases = config["target_phrases"][class_name]  # Dictionary of phrases per class
+            
+            # Generate training clips for this class
+            logging.info("#"*50 + f"\nGenerating {class_name} clips for training\n" + "#"*50)
+            if not os.path.exists(class_train_dirs[class_name]):
+                os.mkdir(class_train_dirs[class_name])
+            n_current_samples = len(os.listdir(class_train_dirs[class_name]))
+            if n_current_samples <= 0.95*config["n_samples"]:
+                generate_samples(
+                    text=target_phrases, max_samples=config["n_samples"]-n_current_samples,
+                    batch_size=config["tts_batch_size"],
+                    noise_scales=[0.98], noise_scale_ws=[0.98], length_scales=[0.75, 1.0, 1.25],
+                    output_dir=class_train_dirs[class_name], auto_reduce_batch_size=True,
+                    file_names=[uuid.uuid4().hex + ".wav" for i in range(config["n_samples"])]
+                )
+                torch.cuda.empty_cache()
+            else:
+                logging.warning(f"Skipping generation of {class_name} clips for training, as ~{config['n_samples']} already exist")
 
-        # Generate positive clips for testing
-        logging.info("#"*50 + "\nGenerating positive clips for testing\n" + "#"*50)
-        if not os.path.exists(positive_test_output_dir):
-            os.mkdir(positive_test_output_dir)
-        n_current_samples = len(os.listdir(positive_test_output_dir))
-        if n_current_samples <= 0.95*config["n_samples_val"]:
-            generate_samples(text=config["target_phrase"], max_samples=config["n_samples_val"]-n_current_samples,
-                             batch_size=config["tts_batch_size"],
-                             noise_scales=[1.0], noise_scale_ws=[1.0], length_scales=[0.75, 1.0, 1.25],
-                             output_dir=positive_test_output_dir, auto_reduce_batch_size=True)
-            torch.cuda.empty_cache()
-        else:
-            logging.warning(f"Skipping generation of positive clips testing, as ~{config['n_samples_val']} already exist")
+            # Generate testing clips for this class
+            logging.info("#"*50 + f"\nGenerating {class_name} clips for testing\n" + "#"*50)
+            if not os.path.exists(class_test_dirs[class_name]):
+                os.mkdir(class_test_dirs[class_name])
+            n_current_samples = len(os.listdir(class_test_dirs[class_name]))
+            if n_current_samples <= 0.95*config["n_samples_val"]:
+                generate_samples(text=target_phrases, max_samples=config["n_samples_val"]-n_current_samples,
+                                 batch_size=config["tts_batch_size"],
+                                 noise_scales=[1.0], noise_scale_ws=[1.0], length_scales=[0.75, 1.0, 1.25],
+                                 output_dir=class_test_dirs[class_name], auto_reduce_batch_size=True)
+                torch.cuda.empty_cache()
+            else:
+                logging.warning(f"Skipping generation of {class_name} clips for testing, as ~{config['n_samples_val']} already exist")
 
         # Generate adversarial negative clips for training
         logging.info("#"*50 + "\nGenerating negative clips for training\n" + "#"*50)
@@ -698,12 +695,20 @@ if __name__ == '__main__':
         n_current_samples = len(os.listdir(negative_train_output_dir))
         if n_current_samples <= 0.95*config["n_samples"]:
             adversarial_texts = config["custom_negative_phrases"]
-            for target_phrase in config["target_phrase"]:
+            
+            # Generate adversarial texts for all positive classes
+            all_target_phrases = []
+            for class_name in class_names:
+                if class_names.index(class_name) != negative_class_label:
+                    all_target_phrases.extend(config["target_phrases"][class_name])
+            
+            for target_phrase in all_target_phrases:
                 adversarial_texts.extend(generate_adversarial_texts(
                     input_text=target_phrase,
-                    N=config["n_samples"]//len(config["target_phrase"]),
+                    N=config["n_samples"]//len(all_target_phrases),
                     include_partial_phrase=1.0,
                     include_input_words=0.2))
+            
             generate_samples(text=adversarial_texts, max_samples=config["n_samples"]-n_current_samples,
                              batch_size=config["tts_batch_size"]//7,
                              noise_scales=[0.98], noise_scale_ws=[0.98], length_scales=[0.75, 1.0, 1.25],
@@ -721,12 +726,20 @@ if __name__ == '__main__':
         n_current_samples = len(os.listdir(negative_test_output_dir))
         if n_current_samples <= 0.95*config["n_samples_val"]:
             adversarial_texts = config["custom_negative_phrases"]
-            for target_phrase in config["target_phrase"]:
+            
+            # Generate adversarial texts for all positive classes
+            all_target_phrases = []
+            for class_name in class_names:
+                if class_names.index(class_name) != negative_class_label:
+                    all_target_phrases.extend(config["target_phrases"][class_name])
+            
+            for target_phrase in all_target_phrases:
                 adversarial_texts.extend(generate_adversarial_texts(
                     input_text=target_phrase,
-                    N=config["n_samples_val"]//len(config["target_phrase"]),
+                    N=config["n_samples_val"]//len(all_target_phrases),
                     include_partial_phrase=1.0,
                     include_input_words=0.2))
+            
             generate_samples(text=adversarial_texts, max_samples=config["n_samples_val"]-n_current_samples,
                              batch_size=config["tts_batch_size"]//7,
                              noise_scales=[1.0], noise_scale_ws=[1.0], length_scales=[0.75, 1.0, 1.25],
@@ -735,12 +748,13 @@ if __name__ == '__main__':
         else:
             logging.warning(f"Skipping generation of negative clips for testing, as ~{config['n_samples_val']} already exist")
 
-    # Set the total length of the training clips based on the ~median generated clip duration, rounding to the nearest 1000 samples
-    # and setting to 32000 when the median + 750 ms is close to that, as it's a good default value
+    # Set the total length of the training clips based on the ~median generated clip duration
     n = 50  # sample size
-    positive_clips = [str(i) for i in Path(positive_test_output_dir).glob("*.wav")]
+    # Use clips from the first positive class to determine duration
+    first_positive_class = [name for i, name in enumerate(class_names) if i != negative_class_label][0]
+    positive_clips = [str(i) for i in Path(class_test_dirs[first_positive_class]).glob("*.wav")]
     duration_in_samples = []
-    for i in range(n):
+    for i in range(min(n, len(positive_clips))):
         sr, dat = scipy.io.wavfile.read(positive_clips[np.random.randint(0, len(positive_clips))])
         duration_in_samples.append(len(dat))
 
@@ -752,75 +766,105 @@ if __name__ == '__main__':
 
     # Do Data Augmentation
     if args.augment_clips is True:
-        if not os.path.exists(os.path.join(feature_save_dir, "positive_features_train.npy")) or args.overwrite is True:
-            positive_clips_train = [str(i) for i in Path(positive_train_output_dir).glob("*.wav")]*config["augmentation_rounds"]
-            positive_clips_train_generator = augment_clips(positive_clips_train, total_length=config["total_length"],
-                                                           batch_size=config["augmentation_batch_size"],
-                                                           background_clip_paths=background_paths,
-                                                           RIR_paths=rir_paths)
+        feature_files = {}
+        for class_name in class_names:
+            if class_names.index(class_name) != negative_class_label:
+                feature_files[f"{class_name}_train"] = os.path.join(feature_save_dir, f"{class_name}_features_train.npy")
+                feature_files[f"{class_name}_test"] = os.path.join(feature_save_dir, f"{class_name}_features_test.npy")
+        
+        feature_files["negative_train"] = os.path.join(feature_save_dir, "negative_features_train.npy")
+        feature_files["negative_test"] = os.path.join(feature_save_dir, "negative_features_test.npy")
+        
+        # Check if any feature files are missing or if overwrite is requested
+        need_to_generate = args.overwrite or any(not os.path.exists(path) for path in feature_files.values())
+        
+        if need_to_generate:
+            # Generate augmented clips and features for each class
+            for class_name in class_names:
+                if class_names.index(class_name) != negative_class_label:
+                    # Training data
+                    clips_train = [str(i) for i in Path(class_train_dirs[class_name]).glob("*.wav")] * config["augmentation_rounds"]
+                    clips_train_generator = augment_clips(clips_train, total_length=config["total_length"],
+                                                         batch_size=config["augmentation_batch_size"],
+                                                         background_clip_paths=background_paths,
+                                                         RIR_paths=rir_paths)
 
-            positive_clips_test = [str(i) for i in Path(positive_test_output_dir).glob("*.wav")]*config["augmentation_rounds"]
-            positive_clips_test_generator = augment_clips(positive_clips_test, total_length=config["total_length"],
-                                                          batch_size=config["augmentation_batch_size"],
-                                                          background_clip_paths=background_paths,
-                                                          RIR_paths=rir_paths)
+                    # Testing data
+                    clips_test = [str(i) for i in Path(class_test_dirs[class_name]).glob("*.wav")] * config["augmentation_rounds"]
+                    clips_test_generator = augment_clips(clips_test, total_length=config["total_length"],
+                                                        batch_size=config["augmentation_batch_size"],
+                                                        background_clip_paths=background_paths,
+                                                        RIR_paths=rir_paths)
 
-            negative_clips_train = [str(i) for i in Path(negative_train_output_dir).glob("*.wav")]*config["augmentation_rounds"]
+                    # Compute features for this class
+                    logging.info("#"*50 + f"\nComputing openwakeword features for {class_name} samples\n" + "#"*50)
+                    n_cpus = os.cpu_count()
+                    if n_cpus is None:
+                        n_cpus = 1
+                    else:
+                        n_cpus = n_cpus//2
+
+                    compute_features_from_generator(clips_train_generator, n_total=len(os.listdir(class_train_dirs[class_name])),
+                                                    clip_duration=config["total_length"],
+                                                    output_file=feature_files[f"{class_name}_train"],
+                                                    device="gpu" if torch.cuda.is_available() else "cpu",
+                                                    ncpu=n_cpus if not torch.cuda.is_available() else 1)
+
+                    compute_features_from_generator(clips_test_generator, n_total=len(os.listdir(class_test_dirs[class_name])),
+                                                    clip_duration=config["total_length"],
+                                                    output_file=feature_files[f"{class_name}_test"],
+                                                    device="gpu" if torch.cuda.is_available() else "cpu",
+                                                    ncpu=n_cpus if not torch.cuda.is_available() else 1)
+
+            # Generate negative class features
+            negative_clips_train = [str(i) for i in Path(negative_train_output_dir).glob("*.wav")] * config["augmentation_rounds"]
             negative_clips_train_generator = augment_clips(negative_clips_train, total_length=config["total_length"],
                                                            batch_size=config["augmentation_batch_size"],
                                                            background_clip_paths=background_paths,
                                                            RIR_paths=rir_paths)
 
-            negative_clips_test = [str(i) for i in Path(negative_test_output_dir).glob("*.wav")]*config["augmentation_rounds"]
+            negative_clips_test = [str(i) for i in Path(negative_test_output_dir).glob("*.wav")] * config["augmentation_rounds"]
             negative_clips_test_generator = augment_clips(negative_clips_test, total_length=config["total_length"],
                                                           batch_size=config["augmentation_batch_size"],
                                                           background_clip_paths=background_paths,
                                                           RIR_paths=rir_paths)
 
-            # Compute features and save to disk via memmapped arrays
-            logging.info("#"*50 + "\nComputing openwakeword features for generated samples\n" + "#"*50)
-            n_cpus = os.cpu_count()
-            if n_cpus is None:
-                n_cpus = 1
-            else:
-                n_cpus = n_cpus//2
-            compute_features_from_generator(positive_clips_train_generator, n_total=len(os.listdir(positive_train_output_dir)),
-                                            clip_duration=config["total_length"],
-                                            output_file=os.path.join(feature_save_dir, "positive_features_train.npy"),
-                                            device="gpu" if torch.cuda.is_available() else "cpu",
-                                            ncpu=n_cpus if not torch.cuda.is_available() else 1)
-
+            logging.info("#"*50 + "\nComputing openwakeword features for negative samples\n" + "#"*50)
             compute_features_from_generator(negative_clips_train_generator, n_total=len(os.listdir(negative_train_output_dir)),
                                             clip_duration=config["total_length"],
-                                            output_file=os.path.join(feature_save_dir, "negative_features_train.npy"),
-                                            device="gpu" if torch.cuda.is_available() else "cpu",
-                                            ncpu=n_cpus if not torch.cuda.is_available() else 1)
-
-            compute_features_from_generator(positive_clips_test_generator, n_total=len(os.listdir(positive_test_output_dir)),
-                                            clip_duration=config["total_length"],
-                                            output_file=os.path.join(feature_save_dir, "positive_features_test.npy"),
+                                            output_file=feature_files["negative_train"],
                                             device="gpu" if torch.cuda.is_available() else "cpu",
                                             ncpu=n_cpus if not torch.cuda.is_available() else 1)
 
             compute_features_from_generator(negative_clips_test_generator, n_total=len(os.listdir(negative_test_output_dir)),
                                             clip_duration=config["total_length"],
-                                            output_file=os.path.join(feature_save_dir, "negative_features_test.npy"),
+                                            output_file=feature_files["negative_test"],
                                             device="gpu" if torch.cuda.is_available() else "cpu",
                                             ncpu=n_cpus if not torch.cuda.is_available() else 1)
         else:
             logging.warning("Openwakeword features already exist, skipping data augmentation and feature generation")
 
-    # Create openwakeword model
+    # Create multi-class openwakeword model
     if args.train_model is True:
         F = openwakeword.utils.AudioFeatures(device='cpu')
-        input_shape = np.load(os.path.join(feature_save_dir, "positive_features_test.npy")).shape[1:]
+        
+        # Get input shape from one of the feature files
+        first_feature_file = os.path.join(feature_save_dir, f"{[name for i, name in enumerate(class_names) if i != negative_class_label][0]}_features_test.npy")
+        input_shape = np.load(first_feature_file).shape[1:]
 
-        oww = Model(n_classes=1, input_shape=input_shape, model_type=config["model_type"],
-                    layer_dim=config["layer_size"], seconds_per_example=1280*input_shape[0]/16000)
+        oww = MultiClassWakeWordModel(
+            n_classes=n_classes, 
+            input_shape=input_shape, 
+            model_type=config["model_type"],
+            layer_dim=config["layer_size"], 
+            seconds_per_example=1280*input_shape[0]/16000,
+            class_names=class_names,
+            negative_class_label=negative_class_label
+        )
 
-        # Create data transform function for batch generation to handle differ clip lengths (todo: write tests for this)
+        # Create data transform function for batch generation
         def f(x, n=input_shape[0]):
-            """Simple transformation function to ensure negative data is the appropriate shape for the model size"""
+            """Simple transformation function to ensure data is the appropriate shape for the model size"""
             if n > x.shape[1] or n < x.shape[1]:
                 x = np.vstack(x)
                 new_batch = np.array([x[i:i+n, :] for i in range(0, x.shape[0]-n, n)])
@@ -828,22 +872,27 @@ if __name__ == '__main__':
                 return x
             return new_batch
 
-        # Create label transforms as needed for model (currently only supports binary classification models)
-        data_transforms = {key: f for key in config["feature_data_files"].keys()}
-        label_transforms = {}
-        for key in ["positive"] + list(config["feature_data_files"].keys()) + ["adversarial_negative"]:
-            if key == "positive":
-                label_transforms[key] = lambda x: [1 for i in x]
+        # Create feature data files dictionary for training
+        training_feature_files = {}
+        for i, class_name in enumerate(class_names):
+            if i != negative_class_label:
+                training_feature_files[class_name] = os.path.join(feature_save_dir, f"{class_name}_features_train.npy")
             else:
-                label_transforms[key] = lambda x: [0 for i in x]
+                training_feature_files[class_name] = os.path.join(feature_save_dir, "negative_features_train.npy")
 
-        # Add generated positive and adversarial negative clips to the feature data files dictionary
-        config["feature_data_files"]['positive'] = os.path.join(feature_save_dir, "positive_features_train.npy")
-        config["feature_data_files"]['adversarial_negative'] = os.path.join(feature_save_dir, "negative_features_train.npy")
+        # Add any additional feature data files from config
+        if "feature_data_files" in config:
+            training_feature_files.update(config["feature_data_files"])
+
+        # Create label transforms for multi-class classification
+        data_transforms = {key: f for key in training_feature_files.keys()}
+        label_transforms = {}
+        for i, class_name in enumerate(class_names):
+            label_transforms[class_name] = lambda x, class_idx=i: [class_idx for _ in x]
 
         # Make PyTorch data loaders for training and validation data
         batch_generator = mmap_batch_generator(
-            config["feature_data_files"],
+            training_feature_files,
             n_per_class=config["batch_n_per_class"],
             data_transform_funcs=data_transforms,
             label_transform_funcs=label_transforms
@@ -864,34 +913,47 @@ if __name__ == '__main__':
         X_train = torch.utils.data.DataLoader(IterDataset(batch_generator),
                                               batch_size=None, num_workers=n_cpus, prefetch_factor=16)
 
+        # Prepare validation data
         X_val_fp = np.load(config["false_positive_validation_data_path"])
-        X_val_fp = np.array([X_val_fp[i:i+input_shape[0]] for i in range(0, X_val_fp.shape[0]-input_shape[0], 1)])  # reshape to match model
-        X_val_fp_labels = np.zeros(X_val_fp.shape[0]).astype(np.float32)
+        X_val_fp = np.array([X_val_fp[i:i+input_shape[0]] for i in range(0, X_val_fp.shape[0]-input_shape[0], 1)])
+        X_val_fp_labels = np.full(X_val_fp.shape[0], negative_class_label).astype(np.float32)  # All false positives are negative class
         X_val_fp = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(torch.from_numpy(X_val_fp), torch.from_numpy(X_val_fp_labels)),
             batch_size=len(X_val_fp_labels)
         )
 
-        X_val_pos = np.load(os.path.join(feature_save_dir, "positive_features_test.npy"))
-        X_val_neg = np.load(os.path.join(feature_save_dir, "negative_features_test.npy"))
-        labels = np.hstack((np.ones(X_val_pos.shape[0]), np.zeros(X_val_neg.shape[0]))).astype(np.float32)
+        # Combine all test features and labels
+        all_val_features = []
+        all_val_labels = []
+        
+        for i, class_name in enumerate(class_names):
+            if i != negative_class_label:
+                class_features = np.load(os.path.join(feature_save_dir, f"{class_name}_features_test.npy"))
+            else:
+                class_features = np.load(os.path.join(feature_save_dir, "negative_features_test.npy"))
+            
+            all_val_features.append(class_features)
+            all_val_labels.extend([i] * class_features.shape[0])
+
+        X_val_combined = np.vstack(all_val_features)
+        labels_combined = np.array(all_val_labels).astype(np.float32)
 
         X_val = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(
-                torch.from_numpy(np.vstack((X_val_pos, X_val_neg))),
-                torch.from_numpy(labels)
-                ),
-            batch_size=len(labels)
+                torch.from_numpy(X_val_combined),
+                torch.from_numpy(labels_combined)
+            ),
+            batch_size=len(labels_combined)
         )
 
-        # Run auto training
+        # Run auto training (you'll need to implement this for multi-class)
         best_model = oww.auto_train(
             X_train=X_train,
             X_val=X_val,
             false_positive_val_data=X_val_fp,
             steps=config["steps"],
-            max_negative_weight=config["max_negative_weight"],
-            target_fp_per_hour=config["target_false_positives_per_hour"],
+            max_negative_weight=config.get("max_negative_weight", 1.0),
+            target_fp_per_hour=config.get("target_false_positives_per_hour", 1.0),
         )
 
         # Export the trained model to onnx
