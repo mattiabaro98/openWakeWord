@@ -247,6 +247,285 @@ class MultiClassWakeWordModel(nn.Module):
             opset_version=13
         )
 
+    def auto_train(self, train_loader, val_loader, false_positive_val_loader, 
+               steps=50000, target_fp_per_hour=0.5, val_set_hrs=11.3,
+               initial_class_weights=None, max_class_weight_multiplier=10.0):
+        """
+        Automated training sequence for multi-class wake word model.
+        Performs multiple training phases with progressively refined parameters.
+        
+        Args:
+            train_loader: Training data loader
+            val_loader: Validation data loader  
+            false_positive_val_loader: Loader for false positive validation data
+            steps: Base number of training steps for first sequence
+            target_fp_per_hour: Target false positives per hour
+            val_set_hrs: Hours of validation data for FP rate calculation
+            initial_class_weights: Initial weights for each class [background, wake_word1, wake_word2, ...]
+            max_class_weight_multiplier: Maximum multiplier for background class weight
+        
+        Returns:
+            Final combined model (averaged from best checkpoints)
+        """
+        
+        # Set default class weights if not provided
+        if initial_class_weights is None:
+            # Give more weight to positive classes initially
+            initial_class_weights = [1.0] + [2.0] * (self.n_classes - 1)
+        
+        current_class_weights = initial_class_weights.copy()
+        
+        # Sequence 1: Initial training with moderate class weights
+        logging.info("#" * 50 + "\nStarting training sequence 1...\n" + "#" * 50)
+        lr = 0.001
+        val_steps = np.linspace(steps - int(steps * 0.25), steps, 20).astype(np.int64).tolist()
+        
+        self.train_model(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            false_positive_val_loader=false_positive_val_loader,
+            max_steps=steps,
+            warmup_steps=steps // 5,
+            hold_steps=steps // 3,
+            lr=lr,
+            val_steps=val_steps,
+            val_set_hrs=val_set_hrs,
+            class_weights=current_class_weights,
+            save_checkpoints=True
+        )
+        
+        # Evaluate performance and adjust class weights
+        current_fp_rate = min(self.history["val_fp_per_hour"][-10:]) if self.history["val_fp_per_hour"] else float('inf')
+        logging.info(f"Sequence 1 completed. Best FP rate: {current_fp_rate:.3f}/hour")
+        
+        # Sequence 2: Refined training with adjusted weights
+        logging.info("#" * 50 + "\nStarting training sequence 2...\n" + "#" * 50)
+        lr = lr / 10
+        steps_seq2 = int(steps / 10)
+        
+        # Adjust background class weight if FP rate is too high
+        if current_fp_rate > target_fp_per_hour:
+            weight_multiplier = min(2.0, max_class_weight_multiplier)
+            current_class_weights[self.negative_class_label] *= weight_multiplier
+            logging.info(f"Increasing background class weight by {weight_multiplier}x to reduce false positives...")
+        
+        val_steps = np.linspace(1, steps_seq2, 20).astype(np.int64).tolist()
+        
+        self.train_model(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            false_positive_val_loader=false_positive_val_loader,
+            max_steps=steps_seq2,
+            warmup_steps=steps_seq2 // 5,
+            hold_steps=steps_seq2 // 3,
+            lr=lr,
+            val_steps=val_steps,
+            val_set_hrs=val_set_hrs,
+            class_weights=current_class_weights,
+            save_checkpoints=True
+        )
+        
+        # Evaluate and adjust again
+        current_fp_rate = min(self.history["val_fp_per_hour"][-10:]) if self.history["val_fp_per_hour"] else float('inf')
+        logging.info(f"Sequence 2 completed. Best FP rate: {current_fp_rate:.3f}/hour")
+        
+        # Sequence 3: Final fine-tuning
+        logging.info("#" * 50 + "\nStarting training sequence 3...\n" + "#" * 50)
+        lr = lr / 10
+        steps_seq3 = int(steps_seq2)
+        
+        # Further adjust background class weight if still needed
+        if current_fp_rate > target_fp_per_hour:
+            weight_multiplier = min(2.0, max_class_weight_multiplier / current_class_weights[self.negative_class_label])
+            current_class_weights[self.negative_class_label] *= weight_multiplier
+            logging.info(f"Further increasing background class weight by {weight_multiplier}x...")
+        
+        val_steps = np.linspace(1, steps_seq3, 20).astype(np.int64).tolist()
+        
+        self.train_model(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            false_positive_val_loader=false_positive_val_loader,
+            max_steps=steps_seq3,
+            warmup_steps=steps_seq3 // 5,
+            hold_steps=steps_seq3 // 3,
+            lr=lr,
+            val_steps=val_steps,
+            val_set_hrs=val_set_hrs,
+            class_weights=current_class_weights,
+            save_checkpoints=True
+        )
+        
+        # Model selection and averaging
+        logging.info("Selecting and combining best checkpoints...")
+        
+        if not self.best_models:
+            logging.warning("No checkpoints saved during training!")
+            return self.model
+        
+        # Calculate percentiles for model selection criteria
+        f1_scores = [score['val_f1'] for score in self.best_model_scores]
+        pos_recalls = [score['val_positive_recall'] for score in self.best_model_scores]
+        fp_rates = [score['val_fp_per_hour'] for score in self.best_model_scores]
+        
+        # Select models above certain percentiles
+        f1_threshold = np.percentile(f1_scores, 75)  # Top 25% by F1
+        recall_threshold = np.percentile(pos_recalls, 75)  # Top 25% by positive recall  
+        fp_threshold = np.percentile(fp_rates, 25)  # Bottom 25% by FP rate
+        
+        selected_models = []
+        selected_scores = []
+        
+        for i, (model_state, score) in enumerate(zip(self.best_models, self.best_model_scores)):
+            if (score['val_f1'] >= f1_threshold and 
+                score['val_positive_recall'] >= recall_threshold and 
+                score['val_fp_per_hour'] <= fp_threshold):
+                selected_models.append(model_state)
+                selected_scores.append(score)
+        
+        # If no models meet all criteria, fall back to top models by F1
+        if len(selected_models) == 0:
+            logging.warning("No models met all criteria, selecting top 3 by F1 score")
+            sorted_indices = sorted(range(len(self.best_model_scores)), 
+                                key=lambda i: self.best_model_scores[i]['val_f1'], 
+                                reverse=True)
+            selected_models = [self.best_models[i] for i in sorted_indices[:3]]
+            selected_scores = [self.best_model_scores[i] for i in sorted_indices[:3]]
+        
+        logging.info(f"Selected {len(selected_models)} models for averaging")
+        
+        # Average the selected models
+        if len(selected_models) > 1:
+            combined_model = self._average_model_weights(selected_models)
+        else:
+            combined_model = copy.deepcopy(self.model)
+            combined_model.load_state_dict(selected_models[0])
+        
+        # Evaluate final combined model
+        logging.info("Evaluating final combined model...")
+        combined_model.to(self.device)
+        combined_model.eval()
+        
+        # Validation evaluation
+        all_val_preds = []
+        all_val_targets = []
+        
+        with torch.no_grad():
+            # Standard validation
+            for batch in val_loader:
+                # Convert numpy arrays to tensors if needed
+                if isinstance(batch[0], np.ndarray):
+                    x_val = torch.from_numpy(batch[0]).float().to(self.device)
+                else:
+                    x_val = batch[0].to(self.device)
+                    
+                if isinstance(batch[1], np.ndarray):
+                    # Handle string labels by converting to numeric indices
+                    if batch[1].dtype.kind in {'U', 'S'}:  # Unicode or byte string
+                        y_val_numeric = np.array([self.class_names.index(label) if label in self.class_names else 0 
+                                                for label in batch[1]], dtype=np.int64)
+                        y_val = torch.from_numpy(y_val_numeric).to(self.device)
+                    else:
+                        y_val = torch.from_numpy(batch[1]).long().to(self.device)
+                else:
+                    y_val = batch[1].long().to(self.device)
+                
+                val_logits = combined_model(x_val)
+                all_val_preds.append(val_logits)
+                all_val_targets.append(y_val)
+            
+            all_val_preds = torch.cat(all_val_preds, dim=0)
+            all_val_targets = torch.cat(all_val_targets, dim=0)
+            
+            final_accuracy = self.accuracy(all_val_preds, all_val_targets)
+            final_f1 = self.f1_score(all_val_preds, all_val_targets)
+            final_pos_recall = self.compute_positive_class_recall(all_val_preds, all_val_targets)
+            final_fp = self.compute_false_positives(all_val_preds, all_val_targets)
+            
+            # False positive rate evaluation
+            final_fp_total = 0
+            if false_positive_val_loader:
+                for batch in false_positive_val_loader:
+                    # Convert numpy arrays to tensors if needed
+                    if isinstance(batch[0], np.ndarray):
+                        x_fp = torch.from_numpy(batch[0]).float().to(self.device)
+                    else:
+                        x_fp = batch[0].to(self.device)
+                        
+                    if isinstance(batch[1], np.ndarray):
+                        # Handle string labels by converting to numeric indices
+                        if batch[1].dtype.kind in {'U', 'S'}:  # Unicode or byte string
+                            y_fp_numeric = np.array([self.class_names.index(label) if label in self.class_names else 0 
+                                                for label in batch[1]], dtype=np.int64)
+                            y_fp = torch.from_numpy(y_fp_numeric).to(self.device)
+                        else:
+                            y_fp = torch.from_numpy(batch[1]).long().to(self.device)
+                    else:
+                        y_fp = batch[1].long().to(self.device)
+                    
+                    fp_logits = combined_model(x_fp)
+                    final_fp_total += self.compute_false_positives(fp_logits, y_fp)
+            
+            final_fp_per_hour = final_fp_total.float() / val_set_hrs
+        
+        # Report final metrics
+        logging.info(f"\n" + "=" * 60)
+        logging.info("FINAL MODEL PERFORMANCE")
+        logging.info("=" * 60)
+        logging.info(f"Accuracy: {final_accuracy:.4f}")
+        logging.info(f"F1 Score: {final_f1:.4f}")
+        logging.info(f"Positive Class Recall: {final_pos_recall:.4f}")
+        logging.info(f"False Positives per Hour: {final_fp_per_hour:.2f}")
+        logging.info(f"Models Averaged: {len(selected_models)}")
+        
+        # Per-class performance
+        per_class_precision = self.per_class_precision(all_val_preds, all_val_targets)
+        per_class_recall = self.per_class_recall(all_val_preds, all_val_targets)
+        per_class_f1_scores = self.per_class_f1(all_val_preds, all_val_targets)
+        
+        for i, class_name in enumerate(self.class_names):
+            logging.info(f"{class_name}: Precision={per_class_precision[i]:.3f}, "
+                        f"Recall={per_class_recall[i]:.3f}, F1={per_class_f1_scores[i]:.3f}")
+        
+        logging.info("=" * 60)
+        
+        return combined_model
+
+    def _average_model_weights(self, model_states):
+        """
+        Average the weights of multiple model state dictionaries
+        
+        Args:
+            model_states: List of model state dictionaries
+            
+        Returns:
+            Model with averaged weights
+        """
+        if not model_states:
+            return None
+        
+        # Create a new model instance
+        averaged_model = copy.deepcopy(self.model)
+        averaged_state_dict = averaged_model.state_dict()
+        
+        # Initialize with zeros
+        for key in averaged_state_dict:
+            averaged_state_dict[key] = torch.zeros_like(averaged_state_dict[key])
+        
+        # Sum all model weights
+        for state_dict in model_states:
+            for key, value in state_dict.items():
+                averaged_state_dict[key] += value
+        
+        # Average by number of models
+        for key in averaged_state_dict:
+            averaged_state_dict[key] /= len(model_states)
+        
+        # Load averaged weights
+        averaged_model.load_state_dict(averaged_state_dict)
+        
+        return averaged_model
+
     def predict_on_features(self, features, return_probabilities=True):
         """
         Predict on feature tensors
@@ -315,10 +594,22 @@ class MultiClassWakeWordModel(nn.Module):
         
         return predictions, predicted_classes
 
+    def export_model(self, model, model_name, output_dir):
+        """Saves the trained openwakeword model to both onnx and tflite formats"""
+
+        # Save ONNX model
+        logging.info(f"####\nSaving ONNX mode as '{os.path.join(output_dir, model_name + '.onnx')}'")
+        model_to_save = copy.deepcopy(model)
+        torch.onnx.export(model_to_save.to("cpu"), torch.rand(self.input_shape)[None, ],
+                          os.path.join(output_dir, model_name + ".onnx"), opset_version=13)
+
+        return None
+
+
     def train_model(self, train_loader, val_loader, false_positive_val_loader=None,
-                   max_steps=10000, warmup_steps=1000, hold_steps=2000,
-                   lr=0.001, val_steps=None, val_set_hrs=1.0,
-                   class_weights=None, save_checkpoints=True):
+               max_steps=10000, warmup_steps=1000, hold_steps=2000,
+               lr=0.001, val_steps=None, val_set_hrs=1.0,
+               class_weights=None, save_checkpoints=True):
         """
         Train the multi-class wake word model
         
@@ -359,7 +650,23 @@ class MultiClassWakeWordModel(nn.Module):
                 train_iter = iter(train_loader)
                 batch = next(train_iter)
             
-            x, y = batch[0].to(self.device), batch[1].to(self.device)
+            # Convert numpy arrays to tensors if needed
+            if isinstance(batch[0], np.ndarray):
+                x = torch.from_numpy(batch[0]).float().to(self.device)
+            else:
+                x = batch[0].to(self.device)
+                
+            if isinstance(batch[1], np.ndarray):
+                # Handle string labels by converting to numeric indices
+                if batch[1].dtype.kind in {'U', 'S'}:  # Unicode or byte string
+                    # Convert string labels to class indices
+                    y_numeric = np.array([self.class_names.index(label) if label in self.class_names else 0 
+                                        for label in batch[1]], dtype=np.int64)
+                    y = torch.from_numpy(y_numeric).to(self.device)
+                else:
+                    y = torch.from_numpy(batch[1]).long().to(self.device)
+            else:
+                y = batch[1].long().to(self.device)
             
             # Update learning rate
             current_lr = self.lr_warmup_cosine_decay(
@@ -391,7 +698,23 @@ class MultiClassWakeWordModel(nn.Module):
                 
                 with torch.no_grad():
                     for val_batch in val_loader:
-                        x_val, y_val = val_batch[0].to(self.device), val_batch[1].to(self.device)
+                        # Convert numpy arrays to tensors if needed
+                        if isinstance(val_batch[0], np.ndarray):
+                            x_val = torch.from_numpy(val_batch[0]).float().to(self.device)
+                        else:
+                            x_val = val_batch[0].to(self.device)
+                            
+                        if isinstance(val_batch[1], np.ndarray):
+                            # Handle string labels by converting to numeric indices
+                            if val_batch[1].dtype.kind in {'U', 'S'}:  # Unicode or byte string
+                                y_val_numeric = np.array([self.class_names.index(label) if label in self.class_names else 0 
+                                                        for label in val_batch[1]], dtype=np.int64)
+                                y_val = torch.from_numpy(y_val_numeric).to(self.device)
+                            else:
+                                y_val = torch.from_numpy(val_batch[1]).long().to(self.device)
+                        else:
+                            y_val = val_batch[1].long().to(self.device)
+                        
                         val_logits = self.model(x_val)
                         val_loss += self.loss_fn(val_logits, y_val).item()
                         
@@ -457,15 +780,15 @@ class MultiClassWakeWordModel(nn.Module):
                         if len(self.best_models) > 10:
                             # Sort by F1 score and keep best
                             sorted_indices = sorted(range(len(self.best_model_scores)), 
-                                                   key=lambda i: self.best_model_scores[i]['val_f1'], 
-                                                   reverse=True)
+                                                key=lambda i: self.best_model_scores[i]['val_f1'], 
+                                                reverse=True)
                             self.best_models = [self.best_models[i] for i in sorted_indices[:10]]
                             self.best_model_scores = [self.best_model_scores[i] for i in sorted_indices[:10]]
                 
                 # Print validation results
                 logging.info(f"Step {step}: Val Acc: {val_accuracy:.4f}, "
-                           f"Val Recall: {val_recall:.4f}, Val F1: {val_f1:.4f}, "
-                           f"FP/hr: {val_fp_per_hour:.2f}, Pos Recall: {val_pos_recall:.4f}")
+                        f"Val Recall: {val_recall:.4f}, Val F1: {val_f1:.4f}, "
+                        f"FP/hr: {val_fp_per_hour:.2f}, Pos Recall: {val_pos_recall:.4f}")
                 
                 self.model.train()
         
@@ -948,12 +1271,10 @@ if __name__ == '__main__':
 
         # Run auto training (you'll need to implement this for multi-class)
         best_model = oww.auto_train(
-            X_train=X_train,
-            X_val=X_val,
-            false_positive_val_data=X_val_fp,
-            steps=config["steps"],
-            max_negative_weight=config.get("max_negative_weight", 1.0),
-            target_fp_per_hour=config.get("target_false_positives_per_hour", 1.0),
+            train_loader=X_train,
+            val_loader=X_val,
+            false_positive_val_loader=X_val_fp,
+            steps=config["steps"]
         )
 
         # Export the trained model to onnx

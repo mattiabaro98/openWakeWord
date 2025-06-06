@@ -3,10 +3,15 @@
 # The name of the model (will be used when creating directoires and when saving the final .onnx and .tflite files)
 model_name: "my_model"
 
-# The target word/phrase to be detected by the model. Adding multiple unique words/phrases will
-# still only train a binary model detection model, but it will activate on any one of the provided words/phrases.
-target_phrase:
-  - "hey jarvis"
+# Target phrases for each class (except negative)
+target_phrases:
+  alexa: ['alexa', 'hey alexa', 'alexa wake up']
+  hey_google: ['hey google', 'ok google', 'google']
+  jarvis: ['jarvis', 'hey jarvis', 'jarvis wake up']
+
+# Multi-class specific settings
+class_names: ['background', 'alexa', 'hey_google', 'jarvis']
+negative_class_label: 0
 
 # Specific phrases that you do *not* want the model to activate on, outside of those generated automatically via phoneme overlap
 # This can be a good way to reduce false positives if you notice that, in practice, certain words or phrases are problematic
@@ -71,15 +76,16 @@ feature_data_files:
   "ACAV100M_sample": "./openwakeword_features_ACAV100M_2000_hrs_16bit.npy"
 
 # Define the number of examples from each data file per batch. Note that the key names here
-# must correspond to those define in the `feature_data_files` dictionary above (except for
-# the `positive` and `adversarial_negative` keys, which are automatically defined). The sum
-# of the values for each key define the total batch size for training. Initial testing indicates
+# must correspond to those define in the `feature_data_files` dictionary above AND to your class names.
+# The sum of the values for each key define the total batch size for training. Initial testing indicates
 # that batch sizes of 1024-4096 work well in practice.
 
 batch_n_per_class:
   "ACAV100M_sample": 1024
-  "adversarial_negative": 50
-  "positive": 50
+  "background": 50        # Changed from "adversarial_negative" to match class_names[0]
+  "alexa": 17             # Changed from "positive" and split among the positive classes
+  "hey_google": 17        # Added explicit entry for this class
+  "jarvis": 16            # Added explicit entry for this class (totals 50 like before)
 
 # Define the type of size of the openwakeword model to train. Increasing the layer size
 # may result in a more capable model, at the cost of decreased inference speed. The default
